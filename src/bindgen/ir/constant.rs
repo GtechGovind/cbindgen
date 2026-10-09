@@ -356,6 +356,84 @@ impl Literal {
         !self.has_pointer_casts()
     }
 
+    // C23 integer constant expressions are more restrictive than C++ constexpr
+    // initializers: in particular, casting floating arithmetic to an integer is
+    // not sufficient. Keep those expressions as macros rather than guessing
+    // their value or changing the shared C/C++ literal representation.
+    fn can_be_c_constexpr(&self, allow_float: bool) -> bool {
+        match self {
+            Literal::Expr(value) => {
+                (value.starts_with('\'') && !value.contains("\\u{"))
+                    || value.starts_with("U'")
+                    || matches!(value.as_str(), "true" | "false")
+                    || (value
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || c == b'u' || c == b'l')
+                        && value
+                            .trim_end_matches(['u', 'l'])
+                            .parse::<u64>()
+                            .is_ok_and(|number| value.contains('u') || number <= i64::MAX as u64))
+                    || (allow_float
+                        && (value.contains('.') || value.contains('e') || value.contains('E'))
+                        && value.parse::<f64>().is_ok())
+            }
+            Literal::Path {
+                associated_to: Some((path, _)),
+                name,
+            } => {
+                // stdint.h has signed MIN bounds, but no UINTn_MIN macros.
+                !(name == "MIN"
+                    && matches!(
+                        PrimitiveType::maybe(path.name()),
+                        Some(PrimitiveType::Integer { signed: false, .. })
+                    ))
+                    && to_known_assoc_constant(path, name).is_some()
+            }
+            Literal::PostfixUnaryOp { op, value } => {
+                // Negating an inferred C int intermediate can overflow even
+                // when the wider Rust destination makes the expression valid.
+                (*op != "-" || matches!(**value, Literal::Expr(_)))
+                    && (*op != "~"
+                        || value.visit(&mut |literal| {
+                            !matches!(literal, Literal::Expr(expr) if matches!(expr.as_str(), "true" | "false"))
+                                && !matches!(literal, Literal::Cast { ty: Type::Primitive(PrimitiveType::Bool), .. })
+                                && !matches!(literal, Literal::BinOp { op, .. } if matches!(*op, "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"))
+                        }))
+                    && value.can_be_c_constexpr(allow_float)
+            }
+            Literal::BinOp { left, op, right } => {
+                // Unsuffixed Rust literals inherit their integer type, whereas
+                // C evaluates them as int before our final conversion. Arithmetic
+                // and shifts can therefore overflow even for valid Rust constants.
+                matches!(
+                    *op,
+                    "&" | "|" | "^" | "&&" | "||" | "==" | "!=" | "<" | "<=" | ">" | ">="
+                ) && left.can_be_c_constexpr(false)
+                    && right.can_be_c_constexpr(false)
+            }
+            Literal::Cast { ty, value } => {
+                let supported_type = match ty {
+                    Type::Primitive(PrimitiveType::Void | PrimitiveType::VaList) => false,
+                    Type::Primitive(PrimitiveType::Float | PrimitiveType::Double) => allow_float,
+                    Type::Primitive(_) => true,
+                    _ => false,
+                };
+                let cast_allows_float = matches!(
+                    ty,
+                    Type::Primitive(PrimitiveType::Float | PrimitiveType::Double)
+                );
+                supported_type && value.can_be_c_constexpr(cast_allows_float)
+            }
+            // Constants can be sorted by name, so a reference is not necessarily
+            // declared yet. Aggregates also need member-wise type checking and
+            // may contain non-null pointers, which C23 constexpr forbids.
+            Literal::Path { .. }
+            | Literal::FieldAccess { .. }
+            | Literal::Struct { .. }
+            | Literal::Array { .. } => false,
+        }
+    }
+
     fn visit(&self, visitor: &mut impl FnMut(&Self) -> bool) -> bool {
         if !visitor(self) {
             return false;
@@ -814,6 +892,17 @@ impl Item for Constant {
 }
 
 impl Constant {
+    fn can_be_c_constexpr(&self) -> bool {
+        match self.ty {
+            Type::Primitive(PrimitiveType::Void | PrimitiveType::VaList) => false,
+            Type::Primitive(PrimitiveType::Float | PrimitiveType::Double) => {
+                self.value.can_be_c_constexpr(true)
+            }
+            Type::Primitive(_) => self.value.can_be_c_constexpr(false),
+            _ => false,
+        }
+    }
+
     pub fn write_declaration<F: Write, LB: LanguageBackend>(
         &self,
         config: &Config,
@@ -920,6 +1009,18 @@ impl Constant {
 
         let allow_constexpr = config.constant.allow_constexpr && self.value.can_be_constexpr();
         match config.language {
+            Language::C if config.constant.allow_constexpr_in_c && self.can_be_c_constexpr() => {
+                out.write("constexpr static const ");
+                crate::bindgen::cdecl::write_field(language_backend, out, &self.ty, &name, config);
+                out.write(" = (");
+                language_backend.write_type(out, &self.ty);
+                out.write(")(");
+                // C23 requires exact representability. The explicit conversion
+                // performs the narrowing normally applied by initialization,
+                // e.g. for f32 literals or integer-promoted bitwise expressions.
+                language_backend.write_literal(out, value);
+                out.write(");");
+            }
             Language::Cxx if config.constant.allow_static_const || allow_constexpr => {
                 if allow_constexpr {
                     out.write("constexpr ")
