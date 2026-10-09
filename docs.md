@@ -1037,23 +1037,13 @@ allow_constexpr = false
 # Requires a C23 compiler. Independent of the C++ allow_constexpr and
 # allow_static_const settings; does not affect C++ or Cython output.
 #
-# Supports integer, floating-point, boolean and character constants whose
-# initializers are self-contained literals, supported primitive casts and
-# unary/bitwise expressions (including standard integer MAX and signed MIN
-# constants). Unsigned MIN and literals outside the generated C integer range
-# retain their existing macro output.
-# Boolean negation and character literals rendered with Rust Unicode escapes
-# also remain macros rather than promoting unsupported C literal forms.
-# Explicit conversions to the declared type preserve
-# narrowing semantics under C23's exact-representability requirement.
+# Supports integer, floating-point, boolean and character constants, using
+# the same initializer rendering as C++. Explicit conversions to the declared
+# type satisfy C23's exact-representability requirement. The generated
+# initializer must be a valid C23 constant expression; compiler diagnostics
+# apply to unsupported expressions and overflowing intermediate values.
 #
-# Other constants remain #define macros: pointers, arrays, aggregates, aliases,
-# references to user constants, field accesses, and floating-point expressions
-# or casts used to initialize integers, binary arithmetic/shifts, and negation
-# of compound expressions.
-# Integer arithmetic needs type inference to avoid C signed-intermediate overflow.
-# These require additional type/dependency
-# analysis to satisfy C23's stricter constant-expression rules.
+# Pointers, arrays, aggregates and aliases retain their existing macro output.
 #
 # Unlike macros, constexpr objects cannot be used in preprocessor #if/#ifdef
 # expressions. Enable this only when consumers use these constants in C code.
